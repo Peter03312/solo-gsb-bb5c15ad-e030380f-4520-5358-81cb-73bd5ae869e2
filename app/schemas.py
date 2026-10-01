@@ -304,6 +304,22 @@ class LedgerRefundItem(BaseModel):
     registered_at: datetime
 
 
+# 付款预留指令条目（待确认/已确认/已取消，按创建次序）
+class LedgerHoldItem(BaseModel):
+    hold_id: int
+    # 唯一指令号
+    hold_ref: str
+    amount: int
+    # pending=待确认（占用可用额）；confirmed=已确认（已转为付款）；
+    # cancelled=已取消（额度已释放）
+    status: str
+    # 确认时提交的外部付款流水号与登记的付款；未确认为 None
+    external_ref: str | None
+    payment_id: int | None
+    created_at: datetime
+    resolved_at: datetime | None
+
+
 class HolderLedger(BaseModel):
     holder_code: str
     name: str | None
@@ -316,10 +332,97 @@ class HolderLedger(BaseModel):
     # 当前余额 = billed_total - paid_total + refunded_total
     # （可为负：跨期负额追补后留待后续抵扣；退回只加回余额，不改变可负性）
     balance: int
+    # 待确认预留指令合计（预留期间占用可用额）
+    pending_holds_total: int
+    # 可用额 = balance - pending_holds_total（新付款/新预留只允许在可用额内）
+    available: int
     statements: list[LedgerStatementItem]
     payments: list[LedgerPaymentItem]
     # 逐笔银行退回（原付款与单据不可变，退回只追加）
     refunds: list[LedgerRefundItem]
+    # 全部付款预留指令及各自状态（指令内容不可改，终态不可逆）
+    holds: list[LedgerHoldItem]
+
+
+# ---- 付款预留指令（预留/取消/确认） ----
+
+class HoldIn(BaseModel):
+    # 权利人编号
+    holder_code: str = Field(min_length=1, max_length=200)
+    # 唯一指令号（调用方提供，全局唯一；同内容重试幂等、异内容 409）
+    hold_ref: str = Field(min_length=1, max_length=200)
+    # 正整数分额（最小货币单位）
+    amount: int = Field(strict=True, ge=1)
+
+    @field_validator("amount", mode="before")
+    @classmethod
+    def reject_bool_amount(cls, v):
+        # JSON 的 true/false 虽是 int 子类，但不是合法金额
+        if isinstance(v, bool):
+            raise ValueError("amount must be an integer, not boolean")
+        return v
+
+
+class HoldOut(BaseModel):
+    hold_id: int
+    holder_code: str
+    hold_ref: str
+    amount: int
+    # 指令状态：pending | confirmed | cancelled
+    hold_status: str
+    # created=新预留；duplicate=同指令号同内容重试，返回原指令
+    status: str
+    created_at: datetime
+    # 操作后的当前可用额（余额 - 全部待确认预留）
+    available_after: int
+
+
+class HoldConfirmIn(BaseModel):
+    # 外部付款流水号（全局唯一；被其他付款占用 409 payment_ref_conflict）
+    external_ref: str = Field(min_length=1, max_length=200)
+
+
+class HoldConfirmOut(BaseModel):
+    hold_id: int
+    hold_ref: str
+    holder_code: str
+    hold_status: str
+    # 原子登记的付款记录
+    payment_id: int
+    external_ref: str
+    amount: int
+    registered_at: datetime
+    # created=新登记；duplicate=同流水号重试，返回原付款记录
+    status: str
+    # 登记后余额（重试时为当前余额）
+    balance_after: int
+    # 当前可用额
+    available_after: int
+
+
+class HoldCancelOut(BaseModel):
+    hold_id: int
+    holder_code: str
+    hold_ref: str
+    amount: int
+    hold_status: str
+    # cancelled=本次取消；already_cancelled=重复取消，返回原指令
+    status: str
+    cancelled_at: datetime
+    # 取消后的当前可用额（额度已释放）
+    available_after: int
+
+
+class HoldDetail(BaseModel):
+    hold_id: int
+    holder_code: str
+    hold_ref: str
+    amount: int
+    hold_status: str
+    external_ref: str | None
+    payment_id: int | None
+    created_at: datetime
+    resolved_at: datetime | None
 
 
 # ---- 银行退票（付款退回）登记 ----

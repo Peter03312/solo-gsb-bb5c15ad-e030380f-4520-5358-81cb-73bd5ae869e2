@@ -375,6 +375,74 @@ DROP TRIGGER IF EXISTS receipt_verification_lines_frozen_trg ON receipt_verifica
 CREATE TRIGGER receipt_verification_lines_frozen_trg
     BEFORE UPDATE OR DELETE ON receipt_verification_lines
     FOR EACH ROW EXECUTE FUNCTION receipts_frozen();
+
+-- 付款预留指令：财务凭"权利人编号 + 唯一指令号(hold_ref) + 正整数分额"预留付款额度。
+-- 仅当 当前余额 - 全部待确认(pending)预留 >= 本额 才创建（应用层在权利人行锁下校验）；
+-- 待确认指令可取消（释放额度），或凭外部付款流水号确认：
+-- 同一事务内登记付款（进现有 payments 体系）并结束预留。
+-- 指令内容（权利人/指令号/金额）一经创建不可改；仅 pending -> confirmed/cancelled
+-- 一次状态迁移，终态不可逆；指令记录不可删除（保留完整审计轨迹）。
+CREATE TABLE IF NOT EXISTS payment_holds (
+    id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    holder_code  text NOT NULL REFERENCES rightsholders(code),
+    hold_ref     text NOT NULL UNIQUE,
+    amount       bigint NOT NULL CHECK (amount > 0),
+    status       text NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending', 'confirmed', 'cancelled')),
+    -- 确认时冻结：提交的外部付款流水号与登记的付款；待确认/已取消恒为空
+    external_ref text,
+    payment_id   bigint UNIQUE REFERENCES payments(id),
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    resolved_at  timestamptz,
+    CONSTRAINT payment_holds_status_fields_chk CHECK (
+        (status = 'pending'
+            AND external_ref IS NULL AND payment_id IS NULL AND resolved_at IS NULL)
+        OR (status = 'confirmed'
+            AND external_ref IS NOT NULL AND payment_id IS NOT NULL
+            AND resolved_at IS NOT NULL)
+        OR (status = 'cancelled'
+            AND external_ref IS NULL AND payment_id IS NULL
+            AND resolved_at IS NOT NULL)
+    )
+);
+-- 按权利人列指令（对账单查询主索引）；待确认预留汇总走 status 过滤
+CREATE INDEX IF NOT EXISTS payment_holds_holder_idx
+    ON payment_holds(holder_code, id);
+
+-- 指令不可变守护：内容字段（权利人/指令号/金额）一经创建不可改；
+-- 仅 pending 可迁移到 confirmed/cancelled（终态不可再改）；指令不可删除。
+CREATE OR REPLACE FUNCTION payment_holds_guard() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'insufficient_privilege',
+            MESSAGE = 'payment hold instructions are append-only and must not be deleted';
+    END IF;
+    IF NEW.holder_code <> OLD.holder_code OR NEW.hold_ref <> OLD.hold_ref
+       OR NEW.amount <> OLD.amount THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'insufficient_privilege',
+            MESSAGE = 'payment hold content (holder/hold_ref/amount) is immutable';
+    END IF;
+    IF OLD.status <> 'pending' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'insufficient_privilege',
+            MESSAGE = 'payment hold already ' || OLD.status
+                      || '; terminal instructions must not be modified';
+    END IF;
+    IF NEW.status NOT IN ('confirmed', 'cancelled') THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'check_violation',
+            MESSAGE = 'payment hold can only transition pending -> confirmed/cancelled';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS payment_holds_guard_trg ON payment_holds;
+CREATE TRIGGER payment_holds_guard_trg
+    BEFORE UPDATE OR DELETE ON payment_holds
+    FOR EACH ROW EXECUTE FUNCTION payment_holds_guard();
 """
 
 

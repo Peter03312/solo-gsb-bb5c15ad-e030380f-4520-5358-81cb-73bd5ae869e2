@@ -4,15 +4,21 @@
 减去全部已登记付款，再加上全部已登记银行退回。试算（preview）不出具、
 待处理播放不计入应付，因此二者天然不进入余额。
 
+可用额口径：余额再减去全部待确认（pending）付款预留指令的合计。
+登记新付款须避开待确认预留：仅当金额不超过当时可用额才入账；
+预留指令的创建/取消/确认见 holds_service。
+
 并发协议（与出单互斥，杜绝超付/超退）：
 - 登记付款先取"外部流水号事务咨询锁"（序列化同一流水号的并发重试），
   再对该权利人行取行锁；余额校验与付款插入在同一事务内原子完成。
 - 登记银行退回先取"退回流水号事务咨询锁"，再锁定原付款行
   （同一原付款的多笔并发退回在此串行，累计退回绝不合计超额），
   随后锁定权利人行（与付款/出单的余额校验互斥）。
+- 预留指令先取"指令号事务咨询锁"（确认时另取付款流水号咨询锁），
+  再锁定权利人行。
 - 出单（statements_service）在写任何明细行前，按权利人编号排序锁定
-  本次受影响的全部权利人行。加锁次序统一为"付款/退回流水号咨询锁 →
-  付款行（仅退回）→ 按编号升序的权利人行"，无死锁。
+  本次受影响的全部权利人行。加锁次序统一为"指令号/付款/退回流水号咨询锁 →
+  付款行（仅退回）→ 按编号升序的权利人行"，权利人行锁永远是最后获取的锁，无死锁。
 """
 import hashlib
 
@@ -77,6 +83,33 @@ def get_balance(conn, holder_code: str) -> int:
     )
 
 
+# 待确认（pending）付款预留指令合计：预留期间从可用额中扣除，
+# 取消（释放）或确认（转为实际付款）后不再计入。
+_PENDING_HOLDS_SQL = """
+SELECT COALESCE(SUM(amount), 0) AS held
+FROM payment_holds
+WHERE holder_code = %s AND status = 'pending'
+"""
+
+
+def get_pending_holds_total(conn, holder_code: str) -> int:
+    """该权利人全部待确认预留指令的金额合计。"""
+    return int(
+        conn.execute(_PENDING_HOLDS_SQL, (holder_code,)).fetchone()["held"]
+    )
+
+
+def get_available(conn, holder_code: str) -> int:
+    """可用额 = 当前余额 - 全部待确认预留（可为负）。
+
+    新付款与新预留都只允许在可用额内发生；确认既有预留不重复扣减
+    （确认校验见 holds_service.confirm_hold）。
+    """
+    return get_balance(conn, holder_code) - get_pending_holds_total(
+        conn, holder_code
+    )
+
+
 def lock_holders_for_billing(conn, holder_codes) -> None:
     """出单侧调用：按编号升序逐个锁定本次受影响的权利人，再写单据明细。
 
@@ -97,8 +130,9 @@ def register_payment(conn, holder_code: str, external_ref: str, amount: int) -> 
     - 权利人不存在：404 holder_not_found，不留付款；
     - 同一流水号同内容重试：返回原付款记录与登记后余额（幂等）；
     - 同一流水号异内容（权利人或金额不同）：409 payment_ref_conflict；
-    - 当前正余额不足（余额 <= 0 或 amount > balance）：
-      409 payment_exceeds_balance，拒绝且不留付款。
+    - 当前可用额不足（可用额 = 正余额 - 待确认预留；可用额 <= 0 或
+      amount > 可用额）：409 payment_exceeds_balance，拒绝且不留付款。
+      新付款须避开待确认预留；无预留时行为与原"正余额内付款"完全一致。
     """
     with conn.transaction():
         # 先按流水号加锁：并发的同流水号请求在此串行化，
@@ -137,8 +171,10 @@ def register_payment(conn, holder_code: str, external_ref: str, amount: int) -> 
             raise _holder_not_found(holder_code)
 
         balance = get_balance(conn, holder_code)
-        if balance <= 0 or amount > balance:
-            raise _exceeds_balance(holder_code, amount, balance)
+        pending = get_pending_holds_total(conn, holder_code)
+        available = balance - pending
+        if available <= 0 or amount > available:
+            raise _exceeds_balance(holder_code, amount, balance, pending)
 
         row = conn.execute(
             """
@@ -184,24 +220,27 @@ def _conflict(external_ref: str, existing) -> "object":
     )
 
 
-def _exceeds_balance(holder_code: str, amount: int, balance: int):
+def _exceeds_balance(holder_code: str, amount: int, balance: int, pending: int = 0):
     from .errors import APIError
 
     return APIError(
         409,
         "payment_exceeds_balance",
-        f"payment amount {amount} exceeds current positive balance {balance} "
-        f"of rightsholder {holder_code}; payment rejected",
+        f"payment amount {amount} exceeds available balance {balance - pending} "
+        f"of rightsholder {holder_code} (balance {balance}, pending holds "
+        f"{pending}); payment rejected",
         detail={
             "holder_code": holder_code,
             "requested_amount": amount,
             "balance": balance,
+            "pending_holds": pending,
+            "available": balance - pending,
         },
     )
 
 
 def get_holder_ledger(conn, holder_code: str):
-    """按权利人查询：基本信息、单据增减、付款流水与当前余额。"""
+    """按权利人查询：基本信息、单据增减、付款流水、逐笔退回、预留指令与当前余额/可用额。"""
     holder = conn.execute(
         "SELECT code, name FROM rightsholders WHERE code = %s",
         (holder_code,),
@@ -243,9 +282,25 @@ def get_holder_ledger(conn, holder_code: str):
         (holder_code,),
     ).fetchall()
 
+    # 全部预留指令（含待确认/已确认/已取消），按创建次序
+    hold_rows = conn.execute(
+        """
+        SELECT id, hold_ref, amount, status, external_ref, payment_id,
+               created_at, resolved_at
+        FROM payment_holds
+        WHERE holder_code = %s
+        ORDER BY id
+        """,
+        (holder_code,),
+    ).fetchall()
+
     billed_total = sum(int(r["amount"]) for r in statement_rows)
     paid_total = sum(int(r["amount"]) for r in payment_rows)
     refunded_total = sum(int(r["amount"]) for r in refund_rows)
+    pending_holds_total = sum(
+        int(r["amount"]) for r in hold_rows if r["status"] == "pending"
+    )
+    balance = billed_total - paid_total + refunded_total
 
     return {
         "holder_code": holder["code"],
@@ -253,7 +308,10 @@ def get_holder_ledger(conn, holder_code: str):
         "billed_total": billed_total,
         "paid_total": paid_total,
         "refunded_total": refunded_total,
-        "balance": billed_total - paid_total + refunded_total,
+        "balance": balance,
+        # 待确认预留合计与可用额（可用额 = 余额 - 待确认预留，可为负）
+        "pending_holds_total": pending_holds_total,
+        "available": balance - pending_holds_total,
         "statements": [
             {
                 "batch_id": r["batch_id"],
@@ -284,5 +342,18 @@ def get_holder_ledger(conn, holder_code: str):
                 "registered_at": r["created_at"],
             }
             for r in refund_rows
+        ],
+        "holds": [
+            {
+                "hold_id": r["id"],
+                "hold_ref": r["hold_ref"],
+                "amount": int(r["amount"]),
+                "status": r["status"],
+                "external_ref": r["external_ref"],
+                "payment_id": r["payment_id"],
+                "created_at": r["created_at"],
+                "resolved_at": r["resolved_at"],
+            }
+            for r in hold_rows
         ],
     }

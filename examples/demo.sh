@@ -266,4 +266,101 @@ $C -X POST "$BASE/receipts/RC-20260301-01/reverify" | python3 -m json.tool
 $C -X POST "$BASE/receipts/RC-20260301-01/reverify" | python3 -m json.tool
 $C "$BASE/receipts/RC-20260301-01/versions/1" | python3 -m json.tool
 
+say "38) 付款预留准备：另建 100% 协议作品，给 RS-A 补充余额 125（不影响 RS-B/RS-C）"
+$C -X POST "$BASE/works" -H 'Content-Type: application/json' \
+  -d '{"code":"W-LIVE-003","title":"加场录音"}'; echo
+$C -X POST "$BASE/agreements" -H 'Content-Type: application/json' -d '{
+  "work_code":"W-LIVE-003",
+  "valid_from":"2026-01-01T00:00:00+08:00",
+  "shares":[{"holder_code":"RS-A","percent":"100"}]
+}'; echo
+$C -X POST "$BASE/plays/import" -H 'Content-Type: application/json' \
+  -d '{"import_id":"PLAY-3001","work_code":"W-LIVE-003","occurred_at":"2026-03-10T20:00:00+08:00","amount":125}'; echo
+$C -X POST "$BASE/statements/issue" -H 'Content-Type: application/json' \
+  -d '{"start":"2026-03-01T00:00:00+08:00","end":"2026-04-01T00:00:00+08:00"}' | python3 -m json.tool
+
+say "39) 预留付款额度：RS-A 预留 80（指令号 HOLD-0001）=> 201，可用额 125-80=45"
+$C -X POST "$BASE/payment-holds" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-A","hold_ref":"HOLD-0001","amount":80}' | python3 -m json.tool
+
+say "40) 同指令号同内容重试 => 200 返回原指令；异内容 => 409 hold_ref_conflict"
+$C -i -X POST "$BASE/payment-holds" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-A","hold_ref":"HOLD-0001","amount":80}' | head -1
+$C -i -X POST "$BASE/payment-holds" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-A","hold_ref":"HOLD-0001","amount":50}' | head -1
+
+say "41) 超出可用额的预留 => 409 hold_exceeds_available（可用 45，预留 46 拒绝，不留指令）"
+$C -i -X POST "$BASE/payment-holds" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-A","hold_ref":"HOLD-0002","amount":46}' | head -1
+$C -i "$BASE/payment-holds/HOLD-0002" | head -1
+
+say "42) 直接付款须避开待确认预留：付 46 => 409；付 45 => 201（余额 80）"
+$C -i -X POST "$BASE/payments" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-A","external_ref":"BANK-20260312-0012","amount":46}' | head -1
+$C -X POST "$BASE/payments" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-A","external_ref":"BANK-20260312-0012","amount":45}' | python3 -m json.tool
+
+say "43) 对账单可见待确认预留、可用额与逐条指令状态（balance=80, pending=80, available=0）"
+$C "$BASE/rightsholders/RS-A/ledger" | python3 -m json.tool
+
+say "44) 确认预留：提交外部流水号 => 201 原子登记付款并结束预留，返回付款记录及余额"
+$C -X POST "$BASE/payment-holds/HOLD-0001/confirm" -H 'Content-Type: application/json' \
+  -d '{"external_ref":"BANK-20260315-0015"}' | python3 -m json.tool
+
+say "45) 确认重试同流水号 => 200 幂等返回原付款；异流水号 => 409；取消已确认指令 => 409"
+$C -i -X POST "$BASE/payment-holds/HOLD-0001/confirm" -H 'Content-Type: application/json' \
+  -d '{"external_ref":"BANK-20260315-0015"}' | head -1
+$C -i -X POST "$BASE/payment-holds/HOLD-0001/confirm" -H 'Content-Type: application/json' \
+  -d '{"external_ref":"BANK-OTHER"}' | head -1
+$C -i -X POST "$BASE/payment-holds/HOLD-0001/cancel" | head -1
+
+say "46) 取消待确认指令释放额度：RS-B 预留 1 后取消，可用额恢复；重复取消幂等；已取消确认 => 409"
+$C -X POST "$BASE/payment-holds" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-B","hold_ref":"HOLD-0003","amount":1}' | python3 -m json.tool
+$C -X POST "$BASE/payment-holds/HOLD-0003/cancel" | python3 -m json.tool
+$C -X POST "$BASE/payment-holds/HOLD-0003/cancel" | python3 -m json.tool
+$C -i -X POST "$BASE/payment-holds/HOLD-0003/confirm" -H 'Content-Type: application/json' \
+  -d '{"external_ref":"BANK-X"}' | head -1
+$C "$BASE/payment-holds/HOLD-0001" | python3 -m json.tool
+
+say "47) 负额追补冲减余额：确认须留足更早创建的待确认指令及本指令金额"
+# RS-C 经 100% 协议作品入账 100；预留 HOLD-0004(60)、HOLD-0005(40) 后负额追补 -70
+$C -X POST "$BASE/works" -H 'Content-Type: application/json' \
+  -d '{"code":"W-LIVE-004","title":"返场录音"}' >/dev/null
+$C -X POST "$BASE/agreements" -H 'Content-Type: application/json' -d '{
+  "work_code":"W-LIVE-004",
+  "valid_from":"2026-01-01T00:00:00+08:00",
+  "shares":[{"holder_code":"RS-C","percent":"100"}]
+}' >/dev/null
+$C -X POST "$BASE/plays/import" -H 'Content-Type: application/json' \
+  -d '{"import_id":"PLAY-4001","work_code":"W-LIVE-004","occurred_at":"2026-05-10T20:00:00+08:00","amount":100}' >/dev/null
+$C -X POST "$BASE/statements/issue" -H 'Content-Type: application/json' \
+  -d '{"start":"2026-05-01T00:00:00+08:00","end":"2026-06-01T00:00:00+08:00"}' >/dev/null
+$C -X POST "$BASE/payment-holds" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-C","hold_ref":"HOLD-0004","amount":60}' | python3 -m json.tool
+$C -X POST "$BASE/payment-holds" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-C","hold_ref":"HOLD-0005","amount":40}' | python3 -m json.tool
+# 负额追补 -70：RS-C 余额 100 -> 30
+$C -X POST "$BASE/plays/import" -H 'Content-Type: application/json' \
+  -d '{"import_id":"PLAY-4001-R1","work_code":"W-LIVE-004","occurred_at":"2026-05-10T20:00:00+08:00","amount":30,"corrects_id":"PLAY-4001"}' >/dev/null
+$C -X POST "$BASE/statements/issue" -H 'Content-Type: application/json' \
+  -d '{"start":"2026-05-01T00:00:00+08:00","end":"2026-06-01T00:00:00+08:00"}' | python3 -m json.tool
+# 确认更晚的 HOLD-0005：须留足更早的 60 + 本指令 40，余额 30 不够 => 409 且指令不变
+$C -i -X POST "$BASE/payment-holds/HOLD-0005/confirm" -H 'Content-Type: application/json' \
+  -d '{"external_ref":"BANK-20260515-0005"}' | head -1
+# 确认更早的 HOLD-0004：余额 30 < 60 同样拒绝；取消更晚指令释放额度后仍不足
+$C -i -X POST "$BASE/payment-holds/HOLD-0004/confirm" -H 'Content-Type: application/json' \
+  -d '{"external_ref":"BANK-20260515-0004"}' | head -1
+$C -X POST "$BASE/payment-holds/HOLD-0005/cancel" | python3 -m json.tool
+$C -i -X POST "$BASE/payment-holds/HOLD-0004/confirm" -H 'Content-Type: application/json' \
+  -d '{"external_ref":"BANK-20260515-0004"}' | head -1
+# 正额追补 +170：余额恢复至 200，HOLD-0004 确认成功（余额 140）
+$C -X POST "$BASE/plays/import" -H 'Content-Type: application/json' \
+  -d '{"import_id":"PLAY-4001-R2","work_code":"W-LIVE-004","occurred_at":"2026-05-10T20:00:00+08:00","amount":200,"corrects_id":"PLAY-4001-R1"}' >/dev/null
+$C -X POST "$BASE/statements/issue" -H 'Content-Type: application/json' \
+  -d '{"start":"2026-05-01T00:00:00+08:00","end":"2026-06-01T00:00:00+08:00"}' >/dev/null
+$C -X POST "$BASE/payment-holds/HOLD-0004/confirm" -H 'Content-Type: application/json' \
+  -d '{"external_ref":"BANK-20260515-0004"}' | python3 -m json.tool
+$C "$BASE/rightsholders/RS-C/ledger" | python3 -m json.tool
+
 say "完成"
