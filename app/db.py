@@ -257,6 +257,94 @@ CREATE TRIGGER payment_refunds_frozen_trg
     BEFORE UPDATE OR DELETE ON payment_refunds
     FOR EACH ROW EXECUTE FUNCTION payment_refunds_frozen();
 
+-- 付款额度预留指令（财务"先预留、后确认付款"两阶段）：
+-- 财务凭权利人编号 holder_code、调用方唯一指令号 instruction_ref 与
+-- 正整数分额 amount 预留付款额度；仅当"当前余额 - 全部待确认预留"仍足额
+-- 时才创建 pending 指令。
+--   pending   待确认：占用预留额度，可取消（释放额度）或确认（原子登记付款）
+--   cancelled 已取消：终态，额度已释放，不可再改
+--   confirmed 已确认：终态，已原子登记一笔 payments 付款（payment_id 绑定）
+-- instruction_ref 全局唯一：同号同内容重试幂等返回原指令，同号异内容拒绝（409）。
+-- 已确认指令的 external_ref 为该笔付款的外部流水号：同流水号确认重试幂等，
+-- 异流水号或流水号已被其他付款占用拒绝（409）。
+CREATE TABLE IF NOT EXISTS payment_instructions (
+    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    holder_code     text NOT NULL REFERENCES rightsholders(code),
+    instruction_ref text NOT NULL UNIQUE,
+    amount          bigint NOT NULL CHECK (amount > 0),
+    status          text NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'cancelled', 'confirmed')),
+    -- 确认时提交的外部付款流水号；仅 confirmed 非空，全局绑定到一笔付款
+    external_ref    text,
+    payment_id      bigint REFERENCES payments(id),
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    confirmed_at    timestamptz,
+    cancelled_at    timestamptz,
+    CONSTRAINT payment_instructions_pending_fields_chk CHECK (
+        status <> 'pending'
+        OR (external_ref IS NULL AND payment_id IS NULL
+            AND confirmed_at IS NULL AND cancelled_at IS NULL)
+    ),
+    CONSTRAINT payment_instructions_cancelled_fields_chk CHECK (
+        status <> 'cancelled'
+        OR (external_ref IS NULL AND payment_id IS NULL
+            AND confirmed_at IS NULL AND cancelled_at IS NOT NULL)
+    ),
+    CONSTRAINT payment_instructions_confirmed_fields_chk CHECK (
+        status <> 'confirmed'
+        OR (external_ref IS NOT NULL AND payment_id IS NOT NULL
+            AND confirmed_at IS NOT NULL AND cancelled_at IS NULL)
+    )
+);
+-- 权利人全部待确认预留汇总（创建预留与直接付款的"避开预留"校验主索引）；
+-- 确认时"更早创建的待确认指令"按创建次序（id 升序）扫描。
+CREATE INDEX IF NOT EXISTS payment_instructions_holder_pending_idx
+    ON payment_instructions(holder_code, id)
+    WHERE status = 'pending';
+-- 确认时按外部流水号反查已确认指令（同流水号确认幂等 / 异流水号拒绝）
+CREATE UNIQUE INDEX IF NOT EXISTS payment_instructions_confirmed_ref_idx
+    ON payment_instructions(external_ref)
+    WHERE status = 'confirmed';
+
+-- 终态与字段守卫：pending 只允许迁移到 cancelled/confirmed（由应用层在持锁
+-- 事务内完成，同时改写对应时间/付款字段）；cancelled/confirmed 为终态，
+-- 任何 UPDATE/DELETE 都被拒绝（历史指令与付款不可改写）。
+CREATE OR REPLACE FUNCTION payment_instructions_guarded() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'insufficient_privilege',
+            MESSAGE = 'payment instructions must not be deleted; history is immutable';
+    END IF;
+    IF OLD.status IN ('cancelled', 'confirmed')
+       OR NEW.status NOT IN ('pending', 'cancelled', 'confirmed')
+       OR NEW.instruction_ref IS DISTINCT FROM OLD.instruction_ref
+       OR NEW.holder_code    IS DISTINCT FROM OLD.holder_code
+       OR NEW.amount         IS DISTINCT FROM OLD.amount
+       OR NEW.id             IS DISTINCT FROM OLD.id
+       OR NEW.created_at     IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'insufficient_privilege',
+            MESSAGE = 'payment instruction ' || OLD.status
+                      || ' is terminal and content must not change';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+DROP TRIGGER IF EXISTS payment_instructions_guarded_trg ON payment_instructions;
+CREATE TRIGGER payment_instructions_guarded_trg
+    BEFORE UPDATE OR DELETE ON payment_instructions
+    FOR EACH ROW EXECUTE FUNCTION payment_instructions_guarded();
+
+-- payments 侧反绑：一笔已登记付款至多绑定一条确认指令；确认预留之外的
+-- 直接登记付款 payment_id 不出现于本表（instruction_id 为空）。
+ALTER TABLE payments
+    ADD COLUMN IF NOT EXISTS instruction_id bigint REFERENCES payment_instructions(id);
+CREATE UNIQUE INDEX IF NOT EXISTS payments_instruction_uniq
+    ON payments(instruction_id)
+    WHERE instruction_id IS NOT NULL;
+
 -- 单据的可追溯性标记：traceable（本轮起出具、带逐笔证据）；
 -- legacy_untraceable（升级前已存在、只有汇总明细行、无法逐笔追溯的存量单据）
 ALTER TABLE statement_batches

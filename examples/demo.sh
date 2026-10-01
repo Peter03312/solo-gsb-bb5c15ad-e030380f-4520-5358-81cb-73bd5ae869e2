@@ -266,4 +266,102 @@ $C -X POST "$BASE/receipts/RC-20260301-01/reverify" | python3 -m json.tool
 $C -X POST "$BASE/receipts/RC-20260301-01/reverify" | python3 -m json.tool
 $C "$BASE/receipts/RC-20260301-01/versions/1" | python3 -m json.tool
 
+# ---- 付款额度预留指令（先预留、后确认付款；独立演示作品/权利人）----
+
+say "38) 预留演示建档：作品 W-RESV-001 + 权利人 RS-R（100%），出单 100 分"
+$C -X POST "$BASE/works" -H 'Content-Type: application/json' \
+  -d '{"code":"W-RESV-001","title":"预留演示录音"}' | python3 -m json.tool
+$C -X POST "$BASE/agreements" -H 'Content-Type: application/json' -d '{
+    "work_code":"W-RESV-001",
+    "valid_from":"2026-01-01T00:00:00+08:00",
+    "valid_to":"2027-01-01T00:00:00+08:00",
+    "shares":[{"holder_code":"RS-R","percent":"100"}]}' | python3 -m json.tool
+$C -X POST "$BASE/plays/import" -H 'Content-Type: application/json' \
+  -d '{"import_id":"RESV-PLAY-1","work_code":"W-RESV-001",
+       "occurred_at":"2026-02-20T20:00:00+08:00","amount":100}' | python3 -m json.tool
+$C -X POST "$BASE/statements/issue" -H 'Content-Type: application/json' \
+  -d '{"start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}' \
+  | python3 -m json.tool
+
+say "39) 预留额度：凭权利人编号 + 唯一指令号 + 正整数分额；仅余额扣除全部待确认预留后仍足额才创建"
+# 预留 60 => 余额 100、待确认预留 60、可用额 40，指令 pending
+$C -X POST "$BASE/payment-reservations" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-R","instruction_ref":"RESV-CMD-0001","amount":60}' \
+  | python3 -m json.tool
+# 再预留 41 > 可用额 40 => 409 payment_exceeds_balance（detail 含 balance/reserved_total/available）
+$C -i -X POST "$BASE/payment-reservations" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-R","instruction_ref":"RESV-CMD-0002","amount":41}' | head -1
+# 待确认预留占用期间，新付款必须避开预留：直接付款 1 分也 409
+$C -i -X POST "$BASE/payments" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-R","external_ref":"BANK-RESV-DIRECT-1","amount":1}' | head -1
+# 同号同内容重试 => 200 status=duplicate 返回原指令；同号异内容 => 409 reservation_ref_conflict
+$C -X POST "$BASE/payment-reservations" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-R","instruction_ref":"RESV-CMD-0001","amount":60}' | python3 -m json.tool
+$C -i -X POST "$BASE/payment-reservations" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-R","instruction_ref":"RESV-CMD-0001","amount":61}' | head -1
+# 再预留恰好 40（可用额归 0）
+$C -X POST "$BASE/payment-reservations" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-R","instruction_ref":"RESV-CMD-0003","amount":40}' | python3 -m json.tool
+
+say "40) 取消待确认指令：额度释放（重复取消幂等；已确认指令不可取消）"
+$C -X POST "$BASE/payment-reservations/RESV-CMD-0003/cancel" | python3 -m json.tool
+$C -X POST "$BASE/payment-reservations/RESV-CMD-0003/cancel" | python3 -m json.tool
+
+say "41) 负额追补 FIFO：更早创建的待确认指令优先受保护"
+# 当前：余额 100、待确认 RESV-CMD-0001=60（更早）。再预留 30（更晚，可用 10）。
+$C -X POST "$BASE/payment-reservations" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-R","instruction_ref":"RESV-CMD-0004","amount":30}' | python3 -m json.tool
+# 播放 100 -> 50（负额追补 -50）：余额变 50；更早 60 + 本指令 30 = 90 > 50，
+# 更晚指令即使自身 30 <= 50 也拒绝（指令保持 pending，不留付款）
+$C -X POST "$BASE/plays/import" -H 'Content-Type: application/json' \
+  -d '{"import_id":"RESV-PLAY-1-R1","work_code":"W-RESV-001",
+       "occurred_at":"2026-02-20T20:00:00+08:00","amount":50,
+       "corrects_id":"RESV-PLAY-1"}' | python3 -m json.tool
+$C -X POST "$BASE/statements/issue" -H 'Content-Type: application/json' \
+  -d '{"start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}' \
+  | python3 -m json.tool
+$C -i -X POST "$BASE/payment-reservations/RESV-CMD-0004/confirm" \
+  -H 'Content-Type: application/json' \
+  -d '{"external_ref":"BANK-RESV-0004"}' | head -1
+# 更早指令 60 也 > 余额 50 => 同样拒绝且指令不变
+$C -i -X POST "$BASE/payment-reservations/RESV-CMD-0001/confirm" \
+  -H 'Content-Type: application/json' \
+  -d '{"external_ref":"BANK-RESV-0001"}' | head -1
+# 播放恢复 50 -> 100（余额回到 100）：按 FIFO 先确认更早的 60，再确认 30
+$C -X POST "$BASE/plays/import" -H 'Content-Type: application/json' \
+  -d '{"import_id":"RESV-PLAY-1-R2","work_code":"W-RESV-001",
+       "occurred_at":"2026-02-20T20:00:00+08:00","amount":100,
+       "corrects_id":"RESV-PLAY-1-R1"}' | python3 -m json.tool
+$C -X POST "$BASE/statements/issue" -H 'Content-Type: application/json' \
+  -d '{"start":"2026-02-01T00:00:00+08:00","end":"2026-03-01T00:00:00+08:00"}' \
+  | python3 -m json.tool
+$C -X POST "$BASE/payment-reservations/RESV-CMD-0001/confirm" \
+  -H 'Content-Type: application/json' -d '{"external_ref":"BANK-RESV-0001"}' \
+  | python3 -m json.tool
+$C -X POST "$BASE/payment-reservations/RESV-CMD-0004/confirm" \
+  -H 'Content-Type: application/json' -d '{"external_ref":"BANK-RESV-0004"}' \
+  | python3 -m json.tool
+
+say "42) 确认幂等与流水号占用：同流水号重试返回原付款(200)；异流水号/被占用流水号 409"
+$C -X POST "$BASE/payment-reservations/RESV-CMD-0001/confirm" \
+  -H 'Content-Type: application/json' -d '{"external_ref":"BANK-RESV-0001"}' \
+  | python3 -m json.tool
+$C -i -X POST "$BASE/payment-reservations/RESV-CMD-0001/confirm" \
+  -H 'Content-Type: application/json' -d '{"external_ref":"BANK-RESV-OTHER"}' | head -1
+# 已确认指令不可取消 => 409 reservation_not_pending
+$C -i -X POST "$BASE/payment-reservations/RESV-CMD-0001/cancel" | head -1
+# 新建一笔 10 分预留，用已被占用的流水号确认 => 409 payment_ref_conflict，指令保持 pending
+$C -X POST "$BASE/payment-reservations" -H 'Content-Type: application/json' \
+  -d '{"holder_code":"RS-R","instruction_ref":"RESV-CMD-0005","amount":10}' \
+  | python3 -m json.tool
+$C -i -X POST "$BASE/payment-reservations/RESV-CMD-0005/confirm" \
+  -H 'Content-Type: application/json' -d '{"external_ref":"BANK-RESV-0001"}' | head -1
+$C -X POST "$BASE/payment-reservations/RESV-CMD-0005/confirm" \
+  -H 'Content-Type: application/json' -d '{"external_ref":"BANK-RESV-0005"}' \
+  | python3 -m json.tool
+
+say "43) 权利人对账：待确认预留 reserved_total、可用额 available_balance 与指令状态 instructions[]"
+$C "$BASE/rightsholders/RS-R/ledger" | python3 -m json.tool
+$C "$BASE/payment-reservations/RESV-CMD-0001" | python3 -m json.tool
+
 say "完成"
